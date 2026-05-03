@@ -19,6 +19,7 @@ from backend.config import settings
 from backend.database import create_tables
 from backend.routes.auth import router as auth_router
 from backend.routes.contracts import router as contracts_router
+from backend.routes.tasks import router as tasks_router
 from backend.routes.api import (
     audit_router,
     compile_router,
@@ -122,6 +123,7 @@ app.include_router(contracts_router, prefix=PREFIX)
 app.include_router(compile_router, prefix=PREFIX)
 app.include_router(audit_router, prefix=PREFIX)
 app.include_router(deploy_router, prefix=PREFIX)
+app.include_router(tasks_router, prefix=PREFIX)   # Task status polling
 app.include_router(ws_router)  # WebSocket — no versioned prefix
 
 

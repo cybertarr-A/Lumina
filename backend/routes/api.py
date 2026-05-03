@@ -1,13 +1,14 @@
 """
 Compile, audit, deploy, and WebSocket routes.
+Production-grade: all heavy tasks dispatched to Celery workers.
+Deploy flow includes wallet signature verification and mandatory audit gate.
 """
 import asyncio
-import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,38 +29,47 @@ from backend.models.models import (
     User,
 )
 from backend.routes.auth import get_current_user
-from backend.services.audit_service import audit_service
-from backend.services.blockchain_service import blockchain_service, CHAIN_CONFIG
-from backend.services.compiler_service import compiler_service
+from backend.services.blockchain_service import CHAIN_CONFIG
 from backend.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 # ── Compile Router ────────────────────────────────────────────────────────────
 compile_router = APIRouter(prefix="/compile", tags=["Compiler"])
 
-@compile_router.post("/", response_model=CompileResponse)
+
+@compile_router.post("/", status_code=202)
 async def compile_contract(
     payload: CompileRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Compile Solidity source code and return ABI + bytecode."""
-    result = compiler_service.compile(
+    """
+    Enqueue a Solidity compilation job.
+    Returns task_id for polling via GET /tasks/{task_id}.
+    """
+    from backend.tasks import compile_contract_task
+
+    task = compile_contract_task.delay(
         source_code=payload.source_code,
+        contract_id=None,
         optimizer=payload.optimizer,
         optimizer_runs=payload.optimizer_runs,
     )
-    return CompileResponse(**result)
+    logger.info("compile_task_queued", task_id=task.id, user_id=str(current_user.id))
+    return {"task_id": task.id, "status": "queued", "poll_url": f"/api/v1/tasks/{task.id}"}
 
 
-@compile_router.post("/save/{contract_id}")
+@compile_router.post("/save/{contract_id}", status_code=202)
 async def compile_and_save(
     contract_id: uuid.UUID,
     payload: CompileRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Compile and save ABI/bytecode to the contract record."""
+    """Enqueue compilation and save ABI/bytecode to contract record on success."""
+    from backend.tasks import compile_contract_task
+
     result_q = await db.execute(
         select(Contract).where(Contract.id == contract_id, Contract.owner_id == current_user.id)
     )
@@ -67,28 +77,32 @@ async def compile_and_save(
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    result = compiler_service.compile(payload.source_code, optimizer=payload.optimizer)
-    if result["success"]:
-        contract.abi = result["abi"]
-        contract.bytecode = result["bytecode"]
-        contract.is_compiled = True
-        await db.flush()
-        logger.info("contract_compiled_saved", contract_id=str(contract_id))
-
-    return CompileResponse(**result)
+    task = compile_contract_task.delay(
+        source_code=payload.source_code,
+        contract_id=str(contract_id),
+        optimizer=payload.optimizer,
+        optimizer_runs=payload.optimizer_runs,
+    )
+    logger.info("compile_save_task_queued", task_id=task.id, contract_id=str(contract_id))
+    return {"task_id": task.id, "status": "queued", "poll_url": f"/api/v1/tasks/{task.id}"}
 
 
 # ── Audit Router ──────────────────────────────────────────────────────────────
 audit_router = APIRouter(prefix="/audit", tags=["Audit"])
 
+
 @audit_router.post("/", response_model=AuditResponse, status_code=202)
 async def run_audit(
     payload: AuditRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Trigger a security audit for a contract (runs in background)."""
+    """
+    Enqueue a security audit job via Celery.
+    Returns report ID immediately. Poll GET /tasks/{task_id} for progress.
+    """
+    from backend.tasks import run_audit_task
+
     result_q = await db.execute(
         select(Contract).where(Contract.id == payload.contract_id, Contract.owner_id == current_user.id)
     )
@@ -96,22 +110,23 @@ async def run_audit(
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    report = AuditReport(
-        contract_id=contract.id,
-        status=AuditStatus.PENDING,
-    )
+    report = AuditReport(contract_id=contract.id, status=AuditStatus.PENDING)
     db.add(report)
     await db.flush()
-    report_id = report.id
+    await db.refresh(report)
+    report_id = str(report.id)
 
-    background_tasks.add_task(
-        _run_audit_task,
-        report_id=report_id,
+    task = run_audit_task.delay(
         source_code=contract.source_code,
         contract_id=str(contract.id),
+        report_id=report_id,
     )
 
-    await db.refresh(report)
+    logger.info("audit_task_queued", task_id=task.id, report_id=report_id)
+    # Attach task_id to report for frontend to poll
+    report.summary = f"task_id:{task.id}"
+    await db.flush()
+
     return report
 
 
@@ -129,34 +144,6 @@ async def get_audit_report(
     return report
 
 
-async def _run_audit_task(report_id: uuid.UUID, source_code: str, contract_id: str):
-    """Background task to run security analysis and update the report."""
-    from backend.database import get_db_context
-    async with get_db_context() as db:
-        result_q = await db.execute(select(AuditReport).where(AuditReport.id == report_id))
-        report = result_q.scalar_one_or_none()
-        if not report:
-            return
-
-        report.status = AuditStatus.RUNNING
-        await db.flush()
-
-        try:
-            audit_result = await audit_service.run_audit(source_code, contract_id)
-            report.status = AuditStatus.COMPLETED
-            report.findings = audit_result["findings"]
-            report.risk_score = audit_result["risk_score"]
-            report.summary = audit_result["summary"]
-            report.analysis_duration_seconds = audit_result["analysis_duration_seconds"]
-            report.completed_at = datetime.now(timezone.utc)
-        except Exception as e:
-            report.status = AuditStatus.FAILED
-            report.summary = f"Audit failed: {str(e)}"
-            logger.error("audit_task_failed", report_id=str(report_id), error=str(e))
-
-        await db.flush()
-
-
 # ── Deploy Router ─────────────────────────────────────────────────────────────
 deploy_router = APIRouter(prefix="/deploy", tags=["Deployment"])
 
@@ -170,19 +157,27 @@ NETWORK_CHAIN_MAP = {
     NetworkName.LOCAL: 31337,
 }
 
+# Audit validity window — contract must have been audited within this period
+AUDIT_VALIDITY_HOURS = 24
+
 
 @deploy_router.post("/", response_model=DeployResponse, status_code=202)
 async def initiate_deployment(
     payload: DeployRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Initiate a deployment. Returns deployment ID immediately.
-    Actual on-chain deployment happens via frontend MetaMask signing.
-    This records the deployment intent and waits for tx hash.
+    Initiate deployment with full security pipeline:
+    1. Verify wallet signature (production only)
+    2. Require recent audit (< 24h)
+    3. Run deployment gate (blocks CRITICAL risk)
+    4. Record deployment intent
     """
+    from backend.pipeline.deploy_gate import deploy_gate, GateDecision
+    from backend.config import settings
+
+    # ── Step 1: Validate contract ownership ──────────────────────────────────
     result_q = await db.execute(
         select(Contract).where(Contract.id == payload.contract_id, Contract.owner_id == current_user.id)
     )
@@ -192,6 +187,72 @@ async def initiate_deployment(
     if not contract.is_compiled:
         raise HTTPException(status_code=400, detail="Contract must be compiled before deployment")
 
+    # ── Step 2: Wallet signature verification ─────────────────────────────────
+    if payload.signature and payload.signed_message:
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_defunct
+            message = encode_defunct(text=payload.signed_message)
+            recovered = Account.recover_message(message, signature=payload.signature)
+            if recovered.lower() != payload.deployer_address.lower():
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Signature verification failed: recovered {recovered} but expected {payload.deployer_address}",
+                )
+            logger.info("wallet_signature_verified", address=payload.deployer_address)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid signature: {str(e)}")
+    elif settings.APP_ENV == "production":
+        raise HTTPException(
+            status_code=400,
+            detail="Wallet signature required for deployment. Sign the deployment message in your wallet.",
+        )
+
+    # ── Step 3: Require recent audit ──────────────────────────────────────────
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=AUDIT_VALIDITY_HOURS)
+    audit_q = await db.execute(
+        select(AuditReport)
+        .where(
+            AuditReport.contract_id == contract.id,
+            AuditReport.status == AuditStatus.COMPLETED,
+            AuditReport.completed_at >= cutoff,
+        )
+        .order_by(AuditReport.completed_at.desc())
+        .limit(1)
+    )
+    latest_audit = audit_q.scalar_one_or_none()
+
+    if not latest_audit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Contract must be audited before deployment. "
+                "Run POST /api/v1/audit/ first. "
+                "A completed audit within the last 24 hours is required."
+            ),
+        )
+
+    # ── Step 4: Deployment gate (risk score check) ────────────────────────────
+    gate_result = deploy_gate.evaluate_from_db_report(
+        risk_score=latest_audit.risk_score or 0.0,
+        findings=latest_audit.findings or [],
+    )
+
+    if gate_result.decision == GateDecision.BLOCKED:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Deployment blocked by security gate",
+                "reason": gate_result.reason,
+                "risk_score": gate_result.risk_score,
+                "risk_level": gate_result.risk_level,
+                "can_override": False,
+            },
+        )
+
+    # ── Step 5: Create deployment record ──────────────────────────────────────
     chain_id = NETWORK_CHAIN_MAP.get(payload.network, 31337)
     deployment = Deployment(
         contract_id=contract.id,
@@ -206,11 +267,21 @@ async def initiate_deployment(
     await db.flush()
     await db.refresh(deployment)
 
-    logger.info("deployment_initiated", deployment_id=str(deployment.id))
+    message = "Deployment initiated. Submit signed transaction via /deploy/{id}/confirm"
+    if gate_result.decision == GateDecision.WARN:
+        message = f"⚠️ {gate_result.reason} | {message}"
+
+    logger.info(
+        "deployment_initiated",
+        deployment_id=str(deployment.id),
+        risk_score=gate_result.risk_score,
+        gate=gate_result.decision,
+    )
+
     return DeployResponse(
         deployment_id=deployment.id,
         status=deployment.status,
-        message="Deployment initiated. Submit signed transaction via /deploy/{id}/confirm",
+        message=message,
     )
 
 
@@ -218,14 +289,15 @@ async def initiate_deployment(
 async def confirm_deployment(
     deployment_id: uuid.UUID,
     tx_hash: str,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Confirm a deployment by providing the transaction hash from MetaMask.
-    Backend will then poll for receipt and update status.
+    Confirm a deployment with a MetaMask transaction hash.
+    Enqueues a Celery polling task to track confirmation.
     """
+    from backend.tasks import poll_deployment_task
+
     result_q = await db.execute(
         select(Deployment).where(Deployment.id == deployment_id, Deployment.user_id == current_user.id)
     )
@@ -237,10 +309,18 @@ async def confirm_deployment(
     deployment.transaction_hash = tx_hash
     await db.flush()
 
-    background_tasks.add_task(
-        _poll_deployment, deployment_id=deployment_id, tx_hash=tx_hash, chain_id=deployment.chain_id
+    task = poll_deployment_task.apply_async(
+        args=[str(deployment_id), tx_hash, deployment.chain_id],
+        countdown=5,  # Wait 5s before first poll
     )
-    return {"message": "Polling for confirmation", "tx_hash": tx_hash}
+
+    logger.info("deployment_poll_queued", task_id=task.id, tx_hash=tx_hash[:10])
+    return {
+        "message": "Polling for on-chain confirmation",
+        "tx_hash": tx_hash,
+        "task_id": task.id,
+        "poll_url": f"/api/v1/tasks/{task.id}",
+    }
 
 
 @deploy_router.get("/{deployment_id}/status", response_model=DeployResponse)
@@ -249,7 +329,7 @@ async def get_deployment_status(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Poll deployment status."""
+    """Poll deployment status from database."""
     result_q = await db.execute(
         select(Deployment).where(Deployment.id == deployment_id, Deployment.user_id == current_user.id)
     )
@@ -277,7 +357,8 @@ async def deployment_history(
         select(Deployment)
         .where(Deployment.user_id == current_user.id)
         .order_by(Deployment.created_at.desc())
-        .offset(skip).limit(limit)
+        .offset(skip)
+        .limit(limit)
     )
     deployments = result_q.scalars().all()
     return [
@@ -297,30 +378,8 @@ async def deployment_history(
 @deploy_router.get("/networks")
 async def list_networks():
     """Return all supported blockchain networks."""
+    from backend.services.blockchain_service import blockchain_service
     return blockchain_service.list_supported_networks()
-
-
-async def _poll_deployment(deployment_id: uuid.UUID, tx_hash: str, chain_id: int):
-    """Background task: poll for transaction receipt and update deployment."""
-    from backend.database import get_db_context
-    async with get_db_context() as db:
-        receipt = await blockchain_service.wait_for_receipt(chain_id, tx_hash)
-        result_q = await db.execute(select(Deployment).where(Deployment.id == deployment_id))
-        deployment = result_q.scalar_one_or_none()
-        if not deployment:
-            return
-
-        if receipt and receipt.get("status") == 1:
-            deployment.status = DeploymentStatus.SUCCESS
-            deployment.contract_address = receipt.get("contract_address")
-            deployment.gas_used = receipt.get("gas_used")
-            deployment.deployed_at = datetime.now(timezone.utc)
-            logger.info("deployment_success", address=deployment.contract_address)
-        else:
-            deployment.status = DeploymentStatus.FAILED
-            deployment.error_message = "Transaction failed or not found"
-            logger.warning("deployment_failed", deployment_id=str(deployment_id))
-        await db.flush()
 
 
 # ── WebSocket Manager ─────────────────────────────────────────────────────────
@@ -339,14 +398,20 @@ class ConnectionManager:
 
     def disconnect(self, user_id: str, ws: WebSocket):
         if user_id in self.active:
-            self.active[user_id].remove(ws)
+            try:
+                self.active[user_id].remove(ws)
+            except ValueError:
+                pass
 
     async def broadcast(self, user_id: str, message: dict):
+        dead = []
         for ws in self.active.get(user_id, []):
             try:
                 await ws.send_json(message)
             except Exception:
-                pass
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(user_id, ws)
 
 
 manager = ConnectionManager()
@@ -358,7 +423,6 @@ async def websocket_endpoint(ws: WebSocket, user_id: str):
     await manager.connect(user_id, ws)
     try:
         while True:
-            # Keep alive — client can send pings
             data = await ws.receive_text()
             if data == "ping":
                 await ws.send_text("pong")

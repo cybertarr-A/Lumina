@@ -305,6 +305,9 @@ class DeployRequest(BaseModel):
     network: NetworkName
     constructor_args: Optional[List[Any]] = None
     deployer_address: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+    # Wallet signature for deployment authorization
+    signed_message: Optional[str] = Field(None, description="The message that was signed by MetaMask")
+    signature: Optional[str] = Field(None, description="Hex signature from eth_sign/personal_sign")
 
 
 class DeployResponse(BaseModel):

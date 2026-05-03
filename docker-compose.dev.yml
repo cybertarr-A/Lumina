@@ -1,0 +1,94 @@
+version: "3.9"
+
+# ── Development Docker Compose ─────────────────────────────────────────────────
+# Lightweight setup with hot-reload and direct port access.
+# Do NOT use in production.
+
+services:
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lumina_redis_dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI Backend ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_backend_dev
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_ENV: development
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      WATCHFILES_FORCE_POLLING: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend   # Hot-reload
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Celery Worker (single, all queues) ────────────────────────────────────────
+  celery-worker:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_celery_dev
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_ENV: development
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    command: celery -A backend.celery_worker worker --loglevel=info --concurrency=2 -Q ai,audit,deploy
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      - backend
+
+  # ── Celery Flower (task monitoring UI) ───────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    container_name: lumina_flower_dev
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      FLOWER_PORT: 5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../infra/docker/Dockerfile.frontend
+    container_name: lumina_frontend_dev
+    restart: unless-stopped
+    env_file: ./frontend/.env.local
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend

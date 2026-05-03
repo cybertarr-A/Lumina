@@ -1,0 +1,235 @@
+version: "3.9"
+
+# ── Production Docker Compose ──────────────────────────────────────────────────
+# Full orchestration: Nginx, separate Celery workers per queue, Flower monitoring.
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+
+services:
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: lumina_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro   # Mount SSL certs here
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+
+  # ── Redis (Queue + Cache + Token Blacklist) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lumina_redis
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI API Gateway ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_backend
+    restart: always
+    env_file: .env
+    environment:
+      APP_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    expose:
+      - "8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      gunicorn backend.main:app
+      -w 4
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 120
+      --graceful-timeout 30
+      --keep-alive 5
+      --access-logfile -
+      --error-logfile -
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  # ── Celery Worker — AI Queue (CPU-bound LLM + compilation) ────────────────────
+  worker-ai:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_worker_ai
+    restart: always
+    env_file: .env
+    environment:
+      APP_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    command: >
+      celery -A backend.celery_worker worker
+      --loglevel=info
+      --concurrency=2
+      -Q ai
+      -n worker-ai@%h
+    depends_on:
+      - redis
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  # ── Celery Worker — Audit Queue (Slither, static analysis) ───────────────────
+  worker-audit:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_worker_audit
+    restart: always
+    env_file: .env
+    environment:
+      APP_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      SLITHER_ENABLED: "true"
+    command: >
+      celery -A backend.celery_worker worker
+      --loglevel=info
+      --concurrency=1
+      -Q audit
+      -n worker-audit@%h
+    depends_on:
+      - redis
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G    # Slither needs more memory
+
+  # ── Celery Worker — Deploy Queue (blockchain polling) ─────────────────────────
+  worker-deploy:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: lumina_worker_deploy
+    restart: always
+    env_file: .env
+    environment:
+      APP_ENV: production
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    command: >
+      celery -A backend.celery_worker worker
+      --loglevel=info
+      --concurrency=4
+      -Q deploy
+      -n worker-deploy@%h
+    depends_on:
+      - redis
+      - backend
+
+  # ── Celery Flower (Task Monitoring) ──────────────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    container_name: lumina_flower
+    restart: always
+    environment:
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      FLOWER_PORT: 5555
+      FLOWER_BASIC_AUTH: admin:${GRAFANA_PASSWORD:-admin123}
+    expose:
+      - "5555"
+    depends_on:
+      - redis
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../infra/docker/Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID}
+    container_name: lumina_frontend
+    restart: always
+    expose:
+      - "3000"
+    depends_on:
+      - backend
+
+  # ── Prometheus ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: lumina_prometheus
+    restart: always
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    expose:
+      - "9090"
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: lumina_grafana
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    expose:
+      - "3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  nginx_logs:

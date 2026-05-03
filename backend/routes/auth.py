@@ -1,12 +1,13 @@
 """
 Authentication routes: register, login, logout, token refresh.
+Production-grade with graceful Redis fallback and secure token rotation.
 """
 import uuid
 from datetime import timedelta
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,11 +38,20 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
 async def get_redis() -> aioredis.Redis:
-    client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    """
+    Yield a Redis client. If Redis is unreachable, yields None.
+    All callers must handle None gracefully (fail-open strategy).
+    """
     try:
-        yield client
-    finally:
-        await client.aclose()
+        client = aioredis.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+        await client.ping()  # Fast connectivity check
+        try:
+            yield client
+        finally:
+            await client.aclose()
+    except Exception as e:
+        logger.warning("redis_unavailable", error=str(e), hint="Proceeding without Redis — tokens won't be blacklisted")
+        yield None  # type: ignore[misc]
 
 
 async def get_current_user(
@@ -49,7 +59,10 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> User:
-    """JWT-protected dependency — validates token and fetches user."""
+    """
+    JWT-protected dependency — validates token, checks blacklist, fetches user.
+    Gracefully handles Redis unavailability (fail-open on blacklist check).
+    """
     credentials_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -64,10 +77,11 @@ async def get_current_user(
         if not user_id:
             raise credentials_exc
 
-        # Check blacklist
-        blacklist = TokenBlacklist(redis)
-        if await blacklist.is_blacklisted(jti):
-            raise credentials_exc
+        # Check blacklist — skipped if Redis is unavailable (fail-open)
+        if redis is not None:
+            blacklist = TokenBlacklist(redis)
+            if await blacklist.is_blacklisted(jti):
+                raise credentials_exc
 
     except JWTError:
         raise credentials_exc
@@ -147,17 +161,21 @@ async def refresh_token(
     except JWTError:
         raise credentials_exc
 
-    blacklist = TokenBlacklist(redis)
-    if await blacklist.is_blacklisted(jti):
-        raise credentials_exc
+    # Check blacklist if Redis available
+    if redis is not None:
+        blacklist = TokenBlacklist(redis)
+        if await blacklist.is_blacklisted(jti):
+            raise credentials_exc
 
     result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise credentials_exc
 
-    # Blacklist used refresh token
-    await blacklist.blacklist_token(jti, settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+    # Blacklist used refresh token (best-effort — Redis may be down)
+    if redis is not None:
+        blacklist = TokenBlacklist(redis)
+        await blacklist.blacklist_token(jti, settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400)
 
     new_access = create_access_token(str(user.id))
     new_refresh = create_refresh_token(str(user.id))
@@ -175,16 +193,17 @@ async def logout(
     token: str = Depends(oauth2_scheme),
     redis: aioredis.Redis = Depends(get_redis),
 ):
-    """Blacklist the current access token."""
+    """Blacklist the current access token. Best-effort if Redis is unavailable."""
     try:
         payload = decode_token(token)
         jti = payload.get("jti", "")
         exp = payload.get("exp", 0)
         import time
         ttl = max(0, int(exp - time.time()))
-        blacklist = TokenBlacklist(redis)
-        await blacklist.blacklist_token(jti, ttl)
-        logger.info("user_logged_out", jti=jti)
+        if redis is not None:
+            blacklist = TokenBlacklist(redis)
+            await blacklist.blacklist_token(jti, ttl)
+        logger.info("user_logged_out", jti=jti, redis_available=redis is not None)
     except JWTError:
         pass  # Already expired token — no action needed
 

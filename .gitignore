@@ -13,8 +13,10 @@ build/
 .turbo/
 *.egg-info/
 .venv/
+backend/.venv
 venv/
 env/
+nginx/certs/
 artifacts/
 cache/
 typechain-types/

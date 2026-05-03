@@ -1,7 +1,10 @@
 """
-Security utilities: JWT tokens, password hashing, rate limiting.
+Security utilities: JWT tokens, password hashing, rate limiting, sanitization.
+Production-grade with Redis fallback, enhanced prompt injection protection,
+and structured sanitization results.
 """
 import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -87,24 +90,75 @@ def verify_token_type(payload: dict, expected_type: str) -> bool:
 # ── Token Blacklist (Redis) ────────────────────────────────────────────────────
 
 class TokenBlacklist:
-    """Redis-backed JWT token blacklist for logout."""
+    """
+    Redis-backed JWT token blacklist for logout.
+    Implements fail-open strategy: if Redis is unavailable, authentication
+    continues without blacklist checks. This is intentional — a Redis outage
+    should degrade gracefully rather than locking all users out.
+    """
 
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client
         self.prefix = "blacklist:"
 
     async def blacklist_token(self, jti: str, expires_in: int) -> None:
-        """Add a token JTI to the blacklist with TTL matching token expiry."""
-        await self.redis.setex(f"{self.prefix}{jti}", expires_in, "1")
-        logger.info("token_blacklisted", jti=jti)
+        """
+        Add a token JTI to the blacklist with TTL matching token expiry.
+        Logs warning on Redis failure but does NOT raise — logout still succeeds.
+        """
+        try:
+            await self.redis.setex(f"{self.prefix}{jti}", expires_in, "1")
+            logger.info("token_blacklisted", jti=jti)
+        except Exception as e:
+            logger.warning(
+                "redis_blacklist_write_failed",
+                jti=jti,
+                error=str(e),
+                hint="Token will expire naturally — Redis unavailable",
+            )
 
     async def is_blacklisted(self, jti: str) -> bool:
-        """Check if a token JTI is in the blacklist."""
-        return bool(await self.redis.exists(f"{self.prefix}{jti}"))
+        """
+        Check if a token JTI is in the blacklist.
+        Returns False on Redis failure (fail-open) to prevent auth lockout.
+        """
+        try:
+            return bool(await self.redis.exists(f"{self.prefix}{jti}"))
+        except Exception as e:
+            logger.warning(
+                "redis_blacklist_check_failed",
+                jti=jti,
+                error=str(e),
+                hint="Proceeding without blacklist check — Redis unavailable",
+            )
+            return False  # Fail-open: Redis outage must not block authentication
 
 
-# ── Input sanitization ────────────────────────────────────────────────────────
+# ── Enhanced Prompt Sanitization ──────────────────────────────────────────────
 
+# Patterns that indicate prompt injection / jailbreak attempts
+JAILBREAK_PATTERNS = [
+    "ignore previous",
+    "ignore above",
+    "ignore all",
+    "disregard",
+    "forget instructions",
+    "new instructions:",
+    "system:",
+    "act as",
+    "you are now",
+    "pretend you",
+    "DAN",
+    "jailbreak",
+    "override",
+    "bypass",
+    "```system",
+    "SYSTEM PROMPT",
+    "im_start",
+    "im_end",
+]
+
+# Patterns that are dangerous in any context
 DANGEROUS_PATTERNS = [
     "selfdestruct",
     "suicide",
@@ -115,15 +169,31 @@ DANGEROUS_PATTERNS = [
     "import os",
     "import sys",
     "subprocess",
+    "rm -rf",
+    "os.system",
+    "__import__",
+    "wget ",
+    "curl ",
+    "chmod ",
+    "sudo ",
 ]
+
+# Solidity-specific dangerous patterns (to flag in output, not block from prompt)
+SOLIDITY_CRITICAL_PATTERNS = {
+    "selfdestruct": "CRITICAL: selfdestruct can permanently destroy contract",
+    "suicide(": "CRITICAL: deprecated alias for selfdestruct",
+    "delegatecall": "HIGH: uncontrolled delegatecall can corrupt storage",
+    "tx.origin": "HIGH: tx.origin authentication is phishing-vulnerable",
+    "assembly {": "MEDIUM: inline assembly bypasses safety checks",
+}
 
 
 def sanitize_prompt(prompt: str) -> tuple[str, list[str]]:
     """
-    Sanitize user AI prompt.
+    Sanitize user AI prompt against injection and dangerous patterns.
     Returns (cleaned_prompt, list_of_warnings).
     """
-    warnings = []
+    warnings: list[str] = []
     cleaned = prompt.strip()
 
     # Length check
@@ -131,13 +201,46 @@ def sanitize_prompt(prompt: str) -> tuple[str, list[str]]:
         cleaned = cleaned[:2000]
         warnings.append("Prompt truncated to 2000 characters")
 
-    # Check for injection attempts
     lower = cleaned.lower()
+
+    # Jailbreak detection — remove and warn
+    for pattern in JAILBREAK_PATTERNS:
+        if pattern.lower() in lower:
+            warnings.append(f"Potential prompt injection detected and neutralized: '{pattern}'")
+            cleaned = re.sub(re.escape(pattern), "[REMOVED]", cleaned, flags=re.IGNORECASE)
+            lower = cleaned.lower()
+
+    # Dangerous code patterns
     for pattern in DANGEROUS_PATTERNS:
-        if pattern in lower:
-            warnings.append(f"Potentially dangerous pattern detected: '{pattern}'")
+        if pattern.lower() in lower:
+            warnings.append(f"Dangerous pattern removed from prompt: '{pattern}'")
+            cleaned = re.sub(re.escape(pattern), "[BLOCKED]", cleaned, flags=re.IGNORECASE)
+            lower = cleaned.lower()
 
     return cleaned, warnings
+
+
+def detect_critical_solidity_patterns(source_code: str) -> list[dict]:
+    """
+    Detect critical security patterns in generated Solidity output.
+    Returns list of violations with severity and line info.
+    """
+    violations = []
+    lines = source_code.split("\n")
+
+    for pattern, description in SOLIDITY_CRITICAL_PATTERNS.items():
+        for i, line in enumerate(lines, 1):
+            if pattern in line.lower():
+                severity = "CRITICAL" if description.startswith("CRITICAL") else "HIGH" if description.startswith("HIGH") else "MEDIUM"
+                violations.append({
+                    "pattern": pattern,
+                    "description": description,
+                    "severity": severity,
+                    "line": i,
+                    "code_snippet": line.strip()[:120],
+                })
+
+    return violations
 
 
 def sanitize_solidity_output(code: str) -> str:
@@ -145,9 +248,6 @@ def sanitize_solidity_output(code: str) -> str:
     Extract only the Solidity code block from AI output.
     Strips markdown fences, explanations, etc.
     """
-    # Extract code between ```solidity ... ``` or ``` ... ```
-    import re
-
     # Try to find solidity code block
     pattern = r"```(?:solidity)?\s*\n(.*?)```"
     matches = re.findall(pattern, code, re.DOTALL)
