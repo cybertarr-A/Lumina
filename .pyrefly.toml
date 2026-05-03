@@ -1,0 +1,20 @@
+# Pyrefly configuration
+# https://github.com/facebook/pyrefly
+
+[python]
+# Point Pyrefly at the project's .venv so it resolves all backend dependencies
+interpreter = ".venv/bin/python"
+version = "3.11"
+
+[project]
+# Treat project root as the source root so `backend.*` imports resolve
+source_root = "."
+
+[errors]
+# Suppress noisy warnings for third-party stubs that Pyrefly doesn't ship
+ignore_missing_imports_from = [
+    "prometheus_fastapi_instrumentator",
+    "slowapi",
+    "solcx",
+    "structlog",
+]

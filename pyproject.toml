@@ -1,0 +1,40 @@
+[project]
+name = "smartcontractgen"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "B"]
+ignore = ["E501", "B008"]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = ["backend/__init__.py", "*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+# ── IDE / Pyright configuration ────────────────────────────────────────────────
+[tool.pyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+pythonPlatform = "Linux"
+typeCheckingMode = "basic"
+
+[tool.pylsp-mypy]
+enabled = false
