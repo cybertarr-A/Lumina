@@ -168,3 +168,44 @@ export const useUIStore = create<UIState>()((set) => ({
   removeNotification: (id) =>
     set((s) => ({ notifications: s.notifications.filter((n) => n.id !== id) })),
 }));
+
+// ── Jobs Store (Celery task tracking) ─────────────────────────────────────────
+
+export type JobType = "generate" | "compile" | "audit" | "deploy";
+export type JobStatus = "pending" | "running" | "success" | "error";
+
+export interface Job {
+  id: string;         // Celery task_id
+  type: JobType;
+  status: JobStatus;
+  label: string;
+  contractId?: string;
+  result?: unknown;
+  error?: string;
+  createdAt: number;
+}
+
+interface JobsState {
+  jobs: Job[];
+  addJob: (job: Job) => void;
+  updateJob: (taskId: string, updates: Partial<Job>) => void;
+  removeJob: (taskId: string) => void;
+  clearFinished: () => void;
+  getJobByType: (type: JobType, contractId?: string) => Job | undefined;
+}
+
+export const useJobsStore = create<JobsState>()((set, get) => ({
+  jobs: [],
+  addJob: (job) => set((s) => ({ jobs: [job, ...s.jobs].slice(0, 20) })), // Keep last 20
+  updateJob: (taskId, updates) =>
+    set((s) => ({
+      jobs: s.jobs.map((j) => (j.id === taskId ? { ...j, ...updates } : j)),
+    })),
+  removeJob: (taskId) =>
+    set((s) => ({ jobs: s.jobs.filter((j) => j.id !== taskId) })),
+  clearFinished: () =>
+    set((s) => ({ jobs: s.jobs.filter((j) => j.status === "pending" || j.status === "running") })),
+  getJobByType: (type, contractId) =>
+    get().jobs.find((j) => j.type === type && (!contractId || j.contractId === contractId)),
+}));
+

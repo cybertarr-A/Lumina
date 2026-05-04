@@ -21,6 +21,7 @@ from backend.models.models import (
 from backend.routes.auth import get_current_user
 from backend.services.ai_service import ai_service
 from backend.services.contract_service import template_service
+from backend.pipeline.sanitizer import pipeline_sanitizer
 from backend.utils.logger import get_logger
 
 router = APIRouter(prefix="/contracts", tags=["Contracts"])
@@ -35,14 +36,34 @@ async def generate_contract(
 ):
     """
     Generate a smart contract using AI or templates.
-    If template_params provided with no AI prompt, uses template engine.
-    Otherwise, uses Groq AI generation.
+    Runs prompt through the pipeline sanitizer first to block injection attacks.
+    Scans LLM output for critical Solidity patterns and reports them.
     """
-    # Try template-first if contract_type is specified and prompt is simple
     source_code = None
     ai_generated = False
     warnings = []
+    critical_violations = []
 
+    # ── Stage 1: Sanitize prompt ────────────────────────────────────────────
+    if payload.prompt:
+        sanitize_result = pipeline_sanitizer.sanitize_prompt(payload.prompt)
+        if not sanitize_result.is_safe:
+            violation_desc = "; ".join(v.get("matched", v["pattern"]) for v in sanitize_result.violations)
+            logger.warning(
+                "prompt_injection_blocked",
+                user_id=str(current_user.id),
+                violations=sanitize_result.violations,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt blocked: potential injection detected ({violation_desc}). Please revise your request.",
+            )
+        clean_prompt = sanitize_result.sanitized_text
+        warnings.extend(sanitize_result.warnings)
+    else:
+        clean_prompt = None
+
+    # ── Stage 2: Template or AI generation ──────────────────────────────────
     if payload.contract_type and payload.template_params:
         try:
             source_code = _render_template(payload.contract_type, payload.name, payload.template_params)
@@ -50,17 +71,41 @@ async def generate_contract(
             logger.warning("template_render_failed", error=str(e))
 
     if not source_code:
-        # Fall back to AI generation
         result = await ai_service.generate_contract(
-            prompt=payload.prompt,
+            prompt=clean_prompt or payload.prompt,
             contract_type=payload.contract_type.value if payload.contract_type else None,
             contract_name=payload.name,
             template_params=payload.template_params,
         )
         source_code = result["source_code"]
-        warnings = result["warnings"]
+        warnings.extend(result.get("warnings", []))
         ai_generated = True
 
+    # ── Stage 3: Validate and scan output ───────────────────────────────────
+    output_result = pipeline_sanitizer.sanitize_output(source_code)
+    if not output_result.is_safe:
+        logger.error(
+            "invalid_ai_output",
+            user_id=str(current_user.id),
+            violations=output_result.violations,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="AI generated invalid Solidity output. Please try rephrasing your prompt.",
+        )
+    source_code = output_result.sanitized_text
+    warnings.extend(output_result.warnings)
+
+    # ── Stage 4: Critical pattern detection (non-blocking, reported) ─────────
+    critical_violations = pipeline_sanitizer.detect_critical_patterns(source_code)
+    if critical_violations:
+        logger.warning(
+            "critical_patterns_in_generated_code",
+            contract_name=payload.name,
+            violations=[v["title"] for v in critical_violations],
+        )
+
+    # ── Save to DB ───────────────────────────────────────────────────────────
     contract = Contract(
         owner_id=current_user.id,
         name=payload.name,
@@ -69,6 +114,11 @@ async def generate_contract(
         source_code=source_code,
         ai_generated=ai_generated,
         ai_prompt=payload.prompt if ai_generated else None,
+        extra_metadata={
+            "warnings": warnings,
+            "critical_violations": critical_violations,
+            "prompt_sanitize_warnings": sanitize_result.warnings if payload.prompt else [],
+        } if (warnings or critical_violations) else None,
     )
     db.add(contract)
     await db.flush()
@@ -84,7 +134,7 @@ async def generate_contract(
     await db.flush()
     await db.refresh(contract)
 
-    logger.info("contract_generated", contract_id=str(contract.id), ai=ai_generated)
+    logger.info("contract_generated", contract_id=str(contract.id), ai=ai_generated, critical_count=len(critical_violations))
     return contract
 
 
