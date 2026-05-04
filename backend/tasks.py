@@ -384,8 +384,4 @@ async def _save_deployment_failed(deployment_id: str, reason: str):
 
 
 # Avoid circular import — imported at runtime
-try:
-    from celery.exceptions import SoftTimeLimitExceeded
-except ImportError:
-    class SoftTimeLimitExceeded(Exception):
-        pass
+from celery.exceptions import SoftTimeLimitExceeded
